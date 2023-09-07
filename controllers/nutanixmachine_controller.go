@@ -33,6 +33,7 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	capiv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api/controllers/remote"
 	capierrors "sigs.k8s.io/cluster-api/errors"
 	capiutil "sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/annotations"
@@ -77,9 +78,11 @@ type NutanixMachineReconciler struct {
 	ConfigMapInformer coreinformers.ConfigMapInformer
 	Scheme            *runtime.Scheme
 	controllerConfig  *ControllerConfig
+	Tracker           *remote.ClusterCacheTracker
+	controller        controller.Controller
 }
 
-func NewNutanixMachineReconciler(client client.Client, secretInformer coreinformers.SecretInformer, configMapInformer coreinformers.ConfigMapInformer, scheme *runtime.Scheme, copts ...ControllerConfigOpts) (*NutanixMachineReconciler, error) {
+func NewNutanixMachineReconciler(client client.Client, tracker *remote.ClusterCacheTracker, secretInformer coreinformers.SecretInformer, configMapInformer coreinformers.ConfigMapInformer, scheme *runtime.Scheme, copts ...ControllerConfigOpts) (*NutanixMachineReconciler, error) {
 	controllerConf := &ControllerConfig{}
 	for _, opt := range copts {
 		if err := opt(controllerConf); err != nil {
@@ -93,12 +96,13 @@ func NewNutanixMachineReconciler(client client.Client, secretInformer coreinform
 		ConfigMapInformer: configMapInformer,
 		Scheme:            scheme,
 		controllerConfig:  controllerConf,
+		Tracker:           tracker,
 	}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *NutanixMachineReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, copts ...ControllerConfigOpts) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	c, err := ctrl.NewControllerManagedBy(mgr).
 		For(&infrav1.NutanixMachine{}).
 		// Watch the CAPI resource that owns this infrastructure resource.
 		Watches(
@@ -112,7 +116,13 @@ func (r *NutanixMachineReconciler) SetupWithManager(ctx context.Context, mgr ctr
 			handler.EnqueueRequestsFromMapFunc(r.mapNutanixClusterToNutanixMachines(ctx)),
 		).
 		WithOptions(controller.Options{MaxConcurrentReconciles: r.controllerConfig.MaxConcurrentReconciles}).
-		Complete(r)
+		Build(r)
+	if err != nil {
+		return errors.Wrap(err, "error creating controller")
+	}
+
+	r.controller = c
+	return nil
 }
 
 func (r *NutanixMachineReconciler) mapNutanixClusterToNutanixMachines(ctx context.Context) handler.MapFunc {
@@ -451,6 +461,11 @@ func (r *NutanixMachineReconciler) reconcileNode(rctx *nctx.MachineContext) (rec
 	log := ctrl.LoggerFrom(rctx.Context)
 	log.V(1).Info("Reconcile the workload cluster node to set its spec.providerID")
 
+	// Create a watch on the nodes in the Cluster.
+	if err := r.watchClusterNodes(rctx.Context, rctx.Cluster); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	clusterKey := apitypes.NamespacedName{
 		Namespace: rctx.Cluster.Namespace,
 		Name:      rctx.Cluster.Name,
@@ -475,8 +490,8 @@ func (r *NutanixMachineReconciler) reconcileNode(rctx *nctx.MachineContext) (rec
 
 	if err := remoteClient.Get(rctx.Context, nodeKey, node); err != nil {
 		if apierrors.IsNotFound(err) {
-			log.Info(fmt.Sprintf("workload node %s not yet ready. Requeuing", nodeName))
-			return reconcile.Result{Requeue: true}, nil
+			log.Info(fmt.Sprintf("workload node %s not yet ready.", nodeName))
+			return reconcile.Result{}, nil
 		} else {
 			log.Error(err, fmt.Sprintf("failed to retrieve the remote workload cluster node %s", nodeName))
 			return reconcile.Result{}, err
@@ -510,6 +525,92 @@ func (r *NutanixMachineReconciler) reconcileNode(rctx *nctx.MachineContext) (rec
 	log.Info(fmt.Sprintf("Patched the workload node %s spec.providerID: %s", nodeName, node.Spec.ProviderID))
 
 	return reconcile.Result{}, nil
+}
+
+func (r *NutanixMachineReconciler) watchClusterNodes(ctx context.Context, cluster *capiv1.Cluster) error {
+	log := ctrl.LoggerFrom(ctx)
+
+	if !conditions.IsTrue(cluster, capiv1.ControlPlaneInitializedCondition) {
+		log.Info("[NODE WATCHER] Skipping node watching setup because control plane is not initialized")
+		return nil
+	}
+
+	// If there is no tracker, don't watch remote nodes
+	if r.Tracker == nil {
+		log.Info("[NODE WATCHER] Skipping node watching setup because no tracker is available")
+		return nil
+	}
+
+	// Watch remote nodes
+	log.Info("[NODE WATCHER] Setting up node watching")
+	log.Info(fmt.Sprintf("[NODE WATCHER] Watching remote nodes for cluster %s/%s", cluster.Namespace, cluster.Name))
+
+	return r.Tracker.Watch(ctx, remote.WatchInput{
+		Name:         "nutanixmachine-watchNodes",
+		Cluster:      apitypes.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace},
+		Watcher:      r.controller,
+		Kind:         &corev1.Node{},
+		EventHandler: handler.EnqueueRequestsFromMapFunc(r.mapNodeToNutanixMachines(ctx)),
+	})
+}
+
+func (r *NutanixMachineReconciler) mapNodeToNutanixMachines(ctx context.Context) handler.MapFunc {
+	return func(o client.Object) []ctrl.Request {
+		log := ctrl.LoggerFrom(ctx)
+
+		// Get node
+		log.Info("[NODE WATCHER] Mapping node to NutanixMachines")
+		log.Info(fmt.Sprintf("[NODE WATCHER] Mapping node to NutanixMachines: %v", o))
+
+		node, ok := o.(*corev1.Node)
+		if !ok {
+			log.Error(fmt.Errorf("[NODE WATCHER] expected a Node object in mapNodeToNutanixMachines but was %T", o), "unexpected type")
+			return nil
+		}
+
+		// Get capiv1.Machine list
+		log.Info("[NODE WATCHER] Mapping node to NutanixMachines: getting Machine list")
+		machineList := &capiv1.MachineList{}
+		if err := r.Client.List(ctx, machineList); err != nil {
+			log.Error(err, "[NODE WATCHER] failed to list Machines")
+			return nil
+		}
+
+		// Get capiv1.Machine for node
+		log.Info("[NODE WATCHER] Mapping node to NutanixMachines: getting Machine for node")
+		var machine *capiv1.Machine
+		for _, m := range machineList.Items {
+			if m.Name == node.Name {
+				machine = &m
+				break
+			}
+		}
+
+		log.Info(fmt.Sprintf("[NODE WATCHER] Mapping node to NutanixMachines: found Machine %v", machine))
+		if machine == nil {
+			log.Info(fmt.Sprintf("[NODE WATCHER] Machine for Node %s not found", node.Name))
+			return nil
+		}
+
+		// Get NutanixMachine
+		log.Info(fmt.Sprintf("[NODE WATCHER] Mapping node to NutanixMachines: getting NutanixMachine %s", machine.Spec.InfrastructureRef.Name))
+		if machine.Spec.InfrastructureRef.Name == "" {
+			log.V(1).Info(fmt.Sprintf("[NODE WATCHER] Machine %s has no infrastructure ref", machine.Name))
+			return nil
+		}
+
+		log.Info(fmt.Sprintf("[NODE WATCHER] Enqueueing NutanixMachine %s for Machine %s for Node %s", machine.Spec.InfrastructureRef.Name, machine.Name, node.Name))
+
+		// Create request
+		return []ctrl.Request{
+			{
+				NamespacedName: client.ObjectKey{
+					Name:      machine.Spec.InfrastructureRef.Name,
+					Namespace: machine.Spec.InfrastructureRef.Namespace,
+				},
+			},
+		}
+	}
 }
 
 func (r *NutanixMachineReconciler) validateMachineConfig(rctx *nctx.MachineContext) error {

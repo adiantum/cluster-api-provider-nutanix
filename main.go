@@ -40,7 +40,9 @@ import (
 	"k8s.io/client-go/tools/cache"
 	capiv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/kubeadm/api/v1beta1"
+	"sigs.k8s.io/cluster-api/controllers/remote"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -132,7 +134,31 @@ func main() {
 	go cmInformer.Run(ctx.Done())
 	cache.WaitForCacheSync(ctx.Done(), cmInformer.HasSynced)
 
+	// Set up a ClusterCacheTracker to provide to controllers
+	// requiring a connection to a remote cluster
+	log := ctrl.Log.WithName("remote").WithName("ClusterCacheTracker")
+	tracker, err := remote.NewClusterCacheTracker(
+		mgr,
+		remote.ClusterCacheTrackerOptions{
+			Log:     &log,
+			Indexes: remote.DefaultIndexes,
+		},
+	)
+	if err != nil {
+		setupLog.Error(err, "unable to create cluster cache tracker")
+		os.Exit(1)
+	}
+
+	if err := (&remote.ClusterCacheReconciler{
+		Client:  mgr.GetClient(),
+		Tracker: tracker,
+	}).SetupWithManager(ctx, mgr, controller.Options{MaxConcurrentReconciles: maxConcurrentReconciles}); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ClusterCacheReconciler")
+		os.Exit(1)
+	}
+
 	clusterCtrl, err := controllers.NewNutanixClusterReconciler(mgr.GetClient(),
+		tracker,
 		secretInformer,
 		configMapInformer,
 		mgr.GetScheme(),
@@ -149,6 +175,7 @@ func main() {
 	}
 	machineCtrl, err := controllers.NewNutanixMachineReconciler(
 		mgr.GetClient(),
+		tracker,
 		secretInformer,
 		configMapInformer,
 		mgr.GetScheme(),

@@ -29,6 +29,7 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	capiv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api/controllers/remote"
 	capiutil "sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/annotations"
 	"sigs.k8s.io/cluster-api/util/conditions"
@@ -54,9 +55,10 @@ type NutanixClusterReconciler struct {
 	ConfigMapInformer coreinformers.ConfigMapInformer
 	Scheme            *runtime.Scheme
 	controllerConfig  *ControllerConfig
+	Tracker           *remote.ClusterCacheTracker
 }
 
-func NewNutanixClusterReconciler(client client.Client, secretInformer coreinformers.SecretInformer, configMapInformer coreinformers.ConfigMapInformer, scheme *runtime.Scheme, copts ...ControllerConfigOpts) (*NutanixClusterReconciler, error) {
+func NewNutanixClusterReconciler(client client.Client, tracker *remote.ClusterCacheTracker, secretInformer coreinformers.SecretInformer, configMapInformer coreinformers.ConfigMapInformer, scheme *runtime.Scheme, copts ...ControllerConfigOpts) (*NutanixClusterReconciler, error) {
 	controllerConf := &ControllerConfig{}
 	for _, opt := range copts {
 		if err := opt(controllerConf); err != nil {
@@ -69,6 +71,7 @@ func NewNutanixClusterReconciler(client client.Client, secretInformer coreinform
 		ConfigMapInformer: configMapInformer,
 		Scheme:            scheme,
 		controllerConfig:  controllerConf,
+		Tracker:           tracker,
 	}, nil
 }
 
