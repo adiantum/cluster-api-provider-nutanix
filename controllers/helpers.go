@@ -30,6 +30,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+
+	nutanixClient "github.com/nutanix-cloud-native/cluster-api-provider-nutanix/pkg/client"
 )
 
 const (
@@ -47,12 +49,8 @@ const (
 func CreateNutanixClient(ctx context.Context, secretInformer coreinformers.SecretInformer, cmInformer coreinformers.ConfigMapInformer, nutanixCluster *infrav1.NutanixCluster) (*nutanixClientV3.Client, error) {
 	log := ctrl.LoggerFrom(ctx)
 	log.V(1).Info("creating nutanix client")
-	helper, err := nutanixClientHelper.NewNutanixClientHelper(secretInformer, cmInformer)
-	if err != nil {
-		log.Error(err, "error creating nutanix client helper")
-		return nil, err
-	}
-	return helper.GetClientFromEnvironment(ctx, nutanixCluster)
+	helper := nutanixClient.NewHelper(secretInformer, cmInformer)
+	return helper.BuildClientForNutanixClusterWithFallback(ctx, nutanixCluster)
 }
 
 // DeleteVM deletes a VM and is invoked by the NutanixMachineReconciler
