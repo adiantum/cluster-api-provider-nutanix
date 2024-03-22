@@ -17,6 +17,8 @@ limitations under the License.
 package v1beta1
 
 import (
+	"fmt"
+
 	credentialTypes "github.com/nutanix-cloud-native/prism-go-client/environment/credentials"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	capiv1 "sigs.k8s.io/cluster-api/api/v1beta1"
@@ -99,6 +101,21 @@ func (ncl *NutanixCluster) GetConditions() capiv1.Conditions {
 // SetConditions sets the conditions on this object.
 func (ncl *NutanixCluster) SetConditions(conditions capiv1.Conditions) {
 	ncl.Status.Conditions = conditions
+}
+
+func (ncl *NutanixCluster) GetPrismCentralCredentialRef() (*credentialTypes.NutanixCredentialReference, error) {
+	prismCentralInfo := ncl.Spec.PrismCentral
+	if prismCentralInfo == nil {
+		return nil, nil
+	}
+	if prismCentralInfo.CredentialRef == nil {
+		return nil, fmt.Errorf("credentialRef must be set on prismCentral attribute for cluster %s in namespace %s", ncl.Name, ncl.Namespace)
+	}
+	if prismCentralInfo.CredentialRef.Kind != credentialTypes.SecretKind {
+		return nil, nil
+	}
+
+	return prismCentralInfo.CredentialRef, nil
 }
 
 //+kubebuilder:object:root=true
