@@ -18,9 +18,12 @@ package controllers
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"time"
 
+	credentialTypes "github.com/nutanix-cloud-native/prism-go-client/environment/credentials"
+	nutanixClientV3 "github.com/nutanix-cloud-native/prism-go-client/v3"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -178,10 +181,21 @@ func (r *NutanixClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 	conditions.MarkTrue(cluster, infrav1.CredentialRefSecretOwnerSetCondition)
 
-	v3Client, err := CreateNutanixClient(ctx, r.SecretInformer, r.ConfigMapInformer, cluster)
+	v3Client, err := nutanixClient.NutanixClientCache.Get(cluster.Name)
 	if err != nil {
-		conditions.MarkFalse(cluster, infrav1.PrismCentralClientCondition, infrav1.PrismCentralClientInitializationFailed, capiv1.ConditionSeverityError, err.Error())
-		return ctrl.Result{Requeue: true}, fmt.Errorf("nutanix client error: %v", err)
+		if stderrors.Is(err, nutanixClientV3.ErrorClientNotFound) {
+			log.Info("Nutanix Prism client not found in cache; Creating new client")
+			v3Client, err = CreateNutanixClient(ctx, r.SecretInformer, r.ConfigMapInformer, cluster)
+			if err != nil {
+				conditions.MarkFalse(cluster, infrav1.PrismCentralClientCondition, infrav1.PrismCentralClientInitializationFailed, capiv1.ConditionSeverityError, err.Error())
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, fmt.Errorf("nutanix prism client error: %w", err)
+			}
+			nutanixClient.NutanixClientCache.Set(cluster.Name, v3Client)
+			conditions.MarkTrue(cluster, infrav1.PrismCentralClientCondition)
+		} else {
+			conditions.MarkFalse(cluster, infrav1.PrismCentralClientCondition, infrav1.PrismCentralClientInitializationFailed, capiv1.ConditionSeverityError, err.Error())
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, fmt.Errorf("nutanix prism client error: %w", err)
+		}
 	}
 	conditions.MarkTrue(cluster, infrav1.PrismCentralClientCondition)
 
@@ -239,6 +253,8 @@ func (r *NutanixClusterReconciler) reconcileDelete(rctx *nctx.ClusterContext) (r
 		Name:      rctx.Cluster.Name,
 	}
 	nctx.RemoveRemoteClient(clusterKey)
+	// delete the client from the cache
+	nutanixClient.NutanixClientCache.Delete(rctx.NutanixCluster.Name)
 
 	return reconcile.Result{}, nil
 }
@@ -306,11 +322,13 @@ func (r *NutanixClusterReconciler) reconcileCategoriesDelete(rctx *nctx.ClusterC
 
 func (r *NutanixClusterReconciler) reconcileCredentialRefDelete(ctx context.Context, nutanixCluster *infrav1.NutanixCluster) error {
 	log := ctrl.LoggerFrom(ctx)
-	credentialRef, err := nutanixClient.GetCredentialRefForCluster(nutanixCluster)
+	credentialRef, err := getPrismCentralCredentialRefForCluster(nutanixCluster)
 	if err != nil {
+		log.Error(err, fmt.Sprintf("error occurred while getting credential ref for cluster %s", nutanixCluster.Name))
 		return err
 	}
 	if credentialRef == nil {
+		log.V(1).Info(fmt.Sprintf("Credential ref is nil for cluster %s. Ignoring since object must be deleted", nutanixCluster.Name))
 		return nil
 	}
 	log.V(1).Info(fmt.Sprintf("Credential ref is kind Secret for cluster %s. Continue with deletion of secret", nutanixCluster.Name))
@@ -321,6 +339,10 @@ func (r *NutanixClusterReconciler) reconcileCredentialRefDelete(ctx context.Cont
 	}
 	err = r.Client.Get(ctx, secretKey, secret)
 	if err != nil {
+		if errors.IsNotFound(err) {
+			log.V(1).Info(fmt.Sprintf("Secret %s in namespace %s for cluster %s not found. Ignoring since object must be deleted", secret.Name, secret.Namespace, nutanixCluster.Name))
+			return nil
+		}
 		return err
 	}
 	ctrlutil.RemoveFinalizer(secret, infrav1.NutanixClusterCredentialFinalizer)
@@ -328,16 +350,21 @@ func (r *NutanixClusterReconciler) reconcileCredentialRefDelete(ctx context.Cont
 	if err := r.Client.Update(ctx, secret); err != nil {
 		return err
 	}
-	log.Info(fmt.Sprintf("removing secret %s in namespace %s for cluster %s", secret.Name, secret.Namespace, nutanixCluster.Name))
-	if err := r.Client.Delete(ctx, secret); err != nil {
-		return err
+
+	if secret.DeletionTimestamp.IsZero() {
+		log.Info(fmt.Sprintf("removing secret %s in namespace %s for cluster %s", secret.Name, secret.Namespace, nutanixCluster.Name))
+		if err := r.Client.Delete(ctx, secret); err != nil && !errors.IsNotFound(err) {
+			return err
+		}
 	}
+
 	return nil
+
 }
 
 func (r *NutanixClusterReconciler) reconcileCredentialRef(ctx context.Context, nutanixCluster *infrav1.NutanixCluster) error {
 	log := ctrl.LoggerFrom(ctx)
-	credentialRef, err := nutanixClient.GetCredentialRefForCluster(nutanixCluster)
+	credentialRef, err := getPrismCentralCredentialRefForCluster(nutanixCluster)
 	if err != nil {
 		return err
 	}
@@ -356,16 +383,21 @@ func (r *NutanixClusterReconciler) reconcileCredentialRef(ctx context.Context, n
 		log.Error(errorMsg, "error occurred fetching cluster")
 		return errorMsg
 	}
+	// Check if ownerRef is already set on nutanixCluster object
 	if !capiutil.IsOwnedByObject(secret, nutanixCluster) {
-		if len(secret.GetOwnerReferences()) > 0 {
-			return fmt.Errorf("secret for cluster %s already has other owners set", nutanixCluster.Name)
+		// Check if another nutanixCluster already has set ownerRef. Secret can only be owned by one nutanixCluster object
+		if capiutil.HasOwner(secret.OwnerReferences, infrav1.GroupVersion.String(), []string{
+			nutanixCluster.Kind,
+		}) {
+			return fmt.Errorf("secret %s already owned by another nutanixCluster object", secret.Name)
 		}
-		secret.SetOwnerReferences([]metav1.OwnerReference{{
+		// Set nutanixCluster ownerRef on the secret
+		secret.OwnerReferences = capiutil.EnsureOwnerRef(secret.OwnerReferences, metav1.OwnerReference{
 			APIVersion: infrav1.GroupVersion.String(),
 			Kind:       nutanixCluster.Kind,
 			UID:        nutanixCluster.UID,
 			Name:       nutanixCluster.Name,
-		}})
+		})
 	}
 	if !ctrlutil.ContainsFinalizer(secret, infrav1.NutanixClusterCredentialFinalizer) {
 		ctrlutil.AddFinalizer(secret, infrav1.NutanixClusterCredentialFinalizer)
@@ -377,4 +409,15 @@ func (r *NutanixClusterReconciler) reconcileCredentialRef(ctx context.Context, n
 		return errorMsg
 	}
 	return nil
+
 }
+
+// getPrismCentralCredentialRefForCluster calls nutanixCluster.GetPrismCentralCredentialRef() function
+// and returns an error if nutanixCluster is nil
+func getPrismCentralCredentialRefForCluster(nutanixCluster *infrav1.NutanixCluster) (*credentialTypes.NutanixCredentialReference, error) {
+	if nutanixCluster == nil {
+		return nil, fmt.Errorf("cannot get credential reference if nutanix cluster object is nil")
+	}
+	return nutanixCluster.GetPrismCentralCredentialRef()
+}
+

@@ -139,4 +139,4 @@ require (
 
 replace golang.org/x/net v0.0.0-20220812174116-3211cb980234 => golang.org/x/net v0.0.0-20220906165146-f3363e06e74c
 
-replace github.com/nutanix-cloud-native/prism-go-client v0.3.5-0.20240326132746-18a22da74d78 => github.com/adiantum/prism-go-client v0.3.4-1
+replace github.com/nutanix-cloud-native/prism-go-client v0.3.4 => github.com/adiantum/prism-go-client v0.3.4-1
