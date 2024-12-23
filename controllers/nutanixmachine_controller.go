@@ -771,6 +771,12 @@ func getDiskList(rctx *nctx.MachineContext) ([]*prismclientv3.VMDisk, error) {
 		diskList = append(diskList, bootstrapDisk)
 	}
 
+	dataDisks, err := getDataDisks(rctx)
+	if err != nil {
+		return nil, err
+	}
+	diskList = append(diskList, dataDisks...)
+
 	return diskList, nil
 }
 
@@ -818,6 +824,17 @@ func getBootstrapDisk(rctx *nctx.MachineContext) (*prismclientv3.VMDisk, error) 
 	}
 
 	return bootstrapDisk, nil
+}
+
+func getDataDisks(rctx *nctx.MachineContext) ([]*prismclientv3.VMDisk, error) {
+	dataDisks, err := CreateDataDiskList(rctx.Context, rctx.NutanixClient, rctx.NutanixMachine.Spec.DataDisks)
+	if err != nil {
+		errorMsg := fmt.Errorf("error occurred while creating data disk spec: %w", err)
+		rctx.SetFailureStatus(capierrors.CreateMachineError, errorMsg)
+		return nil, err
+	}
+
+	return dataDisks, nil
 }
 
 // getBootstrapData returns the Bootstrap data from the ref secret
