@@ -246,6 +246,81 @@ func CreateSystemDiskSpec(imageUUID string, systemDiskSize int64) (*prismclientv
 	return systemDisk, nil
 }
 
+// CreateDataDiskList creates a list of data disks with the given data disk specs
+func CreateDataDiskList(ctx context.Context, client *prismclientv3.Client, dataDiskSpecs []infrav1.NutanixMachineVMDisk) ([]*prismclientv3.VMDisk, error) {
+	dataDisks := make([]*prismclientv3.VMDisk, 0)
+
+	latestDeviceIndexByAdapterType := make(map[string]int64)
+	getDeviceIndex := func(adapterType string) int64 {
+		if latestDeviceIndex, ok := latestDeviceIndexByAdapterType[adapterType]; ok {
+			latestDeviceIndexByAdapterType[adapterType] = latestDeviceIndex + 1
+			return latestDeviceIndex
+		}
+		latestDeviceIndexByAdapterType[adapterType] = 1
+		return 1
+	}
+
+	for _, dataDiskSpec := range dataDiskSpecs {
+		// If no data source is provided, set it to nil
+		var dataSourceReference *prismclientv3.Reference
+
+		// If data source is provided, get the image UUID
+		if dataDiskSpec.DataSource != nil {
+			imageUUID, err := GetImageUUID(ctx, client, dataDiskSpec.DataSource.Name, dataDiskSpec.DataSource.UUID)
+			if err != nil {
+				return nil, err
+			}
+
+			dataSourceReference = &prismclientv3.Reference{
+				Kind: utils.StringPtr("image"),
+				UUID: utils.StringPtr(imageUUID),
+			}
+		}
+
+		// Set deault values for device type and adapter type
+		deviceType := infrav1.NutanixMachineDiskDeviceTypeDisk
+		adapterType := infrav1.NutanixMachineDiskAdapterTypeSATA
+
+		// If device properties are provided, use them
+		if dataDiskSpec.DeviceProperties != nil {
+			deviceType = dataDiskSpec.DeviceProperties.DeviceType
+			adapterType = dataDiskSpec.DeviceProperties.AdapterType
+		}
+
+		// Set device properties
+		deviceProperties := &prismclientv3.VMDiskDeviceProperties{
+			DeviceType: utils.StringPtr(string(deviceType)),
+			DiskAddress: &prismclientv3.DiskAddress{
+				AdapterType: utils.StringPtr(string(adapterType)),
+				DeviceIndex: utils.Int64Ptr(getDeviceIndex(string(adapterType))),
+			},
+		}
+
+		flashMode := "OFF"
+		if dataDiskSpec.StorageConfig.DiskMode == infrav1.NutanixMachineDiskModeFlash {
+			flashMode = "ON"
+		}
+
+		// Set storage config
+		storageConfig := &prismclientv3.VMStorageConfig{
+			FlashMode: flashMode,
+			StorageContainerReference: &prismclientv3.StorageContainerReference{
+				Kind: "storage_container",
+				UUID: *dataDiskSpec.StorageConfig.StorageContainer.Id,
+			},
+		}
+
+		dataDisk := &prismclientv3.VMDisk{
+			DataSourceReference: dataSourceReference,
+			DeviceProperties:    deviceProperties,
+			StorageConfig:       storageConfig,
+			DiskSizeMib:         utils.Int64Ptr(GetMibValueOfQuantity(dataDiskSpec.DiskSize)),
+		}
+		dataDisks = append(dataDisks, dataDisk)
+	}
+	return dataDisks, nil
+}
+
 // GetSubnetUUID returns the UUID of the subnet with the given name
 func GetSubnetUUID(ctx context.Context, client *prismclientv3.Client, peUUID string, subnetName, subnetUUID *string) (string, error) {
 	var foundSubnetUUID string
@@ -762,7 +837,10 @@ func GetFailureDomain(failureDomainName string, nutanixCluster *infrav1.NutanixC
 func getPrismCentralClientForCluster(ctx context.Context, cluster *infrav1.NutanixCluster, secretInformer v1.SecretInformer, mapInformer v1.ConfigMapInformer) (*prismclientv3.Client, error) {
 	log := ctrl.LoggerFrom(ctx)
 
+	log.Info("Get client helper")
 	clientHelper := nutanixclient.NewHelper(secretInformer, mapInformer)
+
+	log.Info("Build management endpoint")
 	managementEndpoint, err := clientHelper.BuildManagementEndpoint(ctx, cluster)
 	if err != nil {
 		log.Error(err, fmt.Sprintf("error occurred while getting management endpoint for cluster %q", cluster.GetNamespacedName()))
@@ -770,6 +848,7 @@ func getPrismCentralClientForCluster(ctx context.Context, cluster *infrav1.Nutan
 		return nil, err
 	}
 
+	log.Info("Get or create prism central client v3")
 	v3Client, err := nutanixclient.NutanixClientCache.GetOrCreate(&nutanixclient.CacheParams{
 		NutanixCluster:          cluster,
 		PrismManagementEndpoint: managementEndpoint,
